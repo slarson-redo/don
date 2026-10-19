@@ -1335,16 +1335,24 @@ fn is_covered(
     mode: RecursiveMode,
     existing: &HashMap<PathBuf, RecursiveMode>,
 ) -> bool {
-    if existing
-        .iter()
-        .any(|(dir, m)| *m == RecursiveMode::Recursive && path.starts_with(dir))
-    {
+    covered_by(path, mode, |dir| existing.get(dir).copied())
+}
+
+/// [`is_covered`] against any lookup of the mode registered at a directory.
+///
+/// Looks up `path` and each of its ancestors rather than scanning every
+/// registration, so the cost is the path's depth, not the number of watched
+/// directories. Registration asks this once per directory it walks.
+fn covered_by(
+    path: &Path,
+    mode: RecursiveMode,
+    registered_mode: impl Fn(&Path) -> Option<RecursiveMode>,
+) -> bool {
+    if mode == RecursiveMode::NonRecursive && registered_mode(path).is_some() {
         return true;
     }
-    if mode == RecursiveMode::NonRecursive && existing.contains_key(path) {
-        return true;
-    }
-    false
+    path.ancestors()
+        .any(|dir| registered_mode(dir) == Some(RecursiveMode::Recursive))
 }
 
 /// Build an `ignore` override matcher from the workspace `watch_ignore` globs,
@@ -1628,26 +1636,30 @@ fn reconcile_watches(
     desired: &[(PathBuf, RecursiveMode)],
     registered: &HashMap<PathBuf, RecursiveMode>,
 ) -> Vec<WatchAction> {
-    // Simulate the registration as we go so a recursive watch planned early in
-    // the batch covers its descendants later in the batch.
-    let mut sim = registered.clone();
+    // What this batch has planned so far, layered over `registered`, so a
+    // recursive watch planned early in the batch covers its descendants later
+    // in the batch. Only the batch's own additions are held: copying
+    // `registered` made every call O(registered dirs), and a monorepo startup
+    // makes thousands of calls against a map of thousands of dirs.
+    let mut planned: HashMap<&Path, RecursiveMode> = HashMap::new();
     // Ancestors first: a recursive ancestor added early covers descendants.
     let mut ordered: Vec<&(PathBuf, RecursiveMode)> = desired.iter().collect();
     ordered.sort_by_key(|(dir, _)| dir.components().count());
 
     let mut actions = Vec::new();
     for (dir, mode) in ordered {
-        if is_covered(dir, *mode, &sim) {
+        let current = |path: &Path| planned.get(path).or_else(|| registered.get(path)).copied();
+        if covered_by(dir, *mode, current) {
             continue;
         }
         let replace =
-            *mode == RecursiveMode::Recursive && sim.get(dir) == Some(&RecursiveMode::NonRecursive);
+            *mode == RecursiveMode::Recursive && current(dir) == Some(RecursiveMode::NonRecursive);
         actions.push(WatchAction {
             dir: dir.clone(),
             mode: *mode,
             replace,
         });
-        sim.insert(dir.clone(), *mode);
+        planned.insert(dir, *mode);
     }
     actions
 }
@@ -2021,6 +2033,26 @@ mod tests {
                 existing: vec![("/a/c", RecursiveMode::Recursive)],
                 expected: false,
             },
+            Case {
+                name: "distant recursive ancestor covers",
+                path: "/a/b/c/d/e",
+                mode: RecursiveMode::NonRecursive,
+                existing: vec![
+                    ("/a", RecursiveMode::Recursive),
+                    ("/a/b/c", RecursiveMode::NonRecursive),
+                ],
+                expected: true,
+            },
+            Case {
+                name: "non-recursive ancestors do not cover a descendant",
+                path: "/a/b/c",
+                mode: RecursiveMode::NonRecursive,
+                existing: vec![
+                    ("/a", RecursiveMode::NonRecursive),
+                    ("/a/b", RecursiveMode::NonRecursive),
+                ],
+                expected: false,
+            },
         ];
 
         for case in cases {
@@ -2103,6 +2135,31 @@ mod tests {
                 registered: vec![("/a", Recursive)],
                 expected: vec![],
             },
+            Case {
+                name: "duplicate requests in one batch register once",
+                desired: vec![("/a", NonRecursive), ("/a", NonRecursive)],
+                registered: vec![],
+                expected: vec![("/a", NonRecursive, false)],
+            },
+            Case {
+                // The batch's own plan must win over the registered set: the
+                // upgrade planned for /a covers /a/b, though /a is still only
+                // registered non-recursively.
+                name: "planned upgrade covers descendants in the same batch",
+                desired: vec![("/a/b", NonRecursive), ("/a", Recursive)],
+                registered: vec![("/a", NonRecursive)],
+                expected: vec![("/a", Recursive, true)],
+            },
+            Case {
+                name: "only unregistered directories of a walked subtree are added",
+                desired: vec![
+                    ("/p", NonRecursive),
+                    ("/p/src", NonRecursive),
+                    ("/p/src/new", NonRecursive),
+                ],
+                registered: vec![("/p", NonRecursive), ("/p/src", NonRecursive)],
+                expected: vec![("/p/src/new", NonRecursive, false)],
+            },
         ];
 
         for case in cases {
@@ -2128,6 +2185,111 @@ mod tests {
 
             let got = reconcile_watches(&desired, &registered);
             assert_eq!(got, expected, "case: {}", case.name);
+        }
+    }
+
+    /// Coverage is answered from the path's ancestors, not by scanning every
+    /// registration. Startup asks once per directory it walks, and a monorepo
+    /// registers thousands, so a scan made registration quadratic.
+    #[test]
+    fn test_covered_by_costs_path_depth_not_registration_count() {
+        let registered: HashMap<PathBuf, RecursiveMode> = (0..10_000)
+            .map(|i| {
+                (
+                    PathBuf::from(format!("/repo/pkg{i}")),
+                    RecursiveMode::NonRecursive,
+                )
+            })
+            .collect();
+        for (path, mode) in [
+            ("/repo/pkg7/src/lib", RecursiveMode::NonRecursive),
+            ("/repo/pkg7/src/lib", RecursiveMode::Recursive),
+            ("/repo/pkg7", RecursiveMode::NonRecursive),
+        ] {
+            let path = Path::new(path);
+            let lookups = std::cell::Cell::new(0usize);
+            covered_by(path, mode, |dir| {
+                lookups.set(lookups.get() + 1);
+                registered.get(dir).copied()
+            });
+            assert!(
+                lookups.get() <= path.ancestors().count() + 1,
+                "{} lookups for {}",
+                lookups.get(),
+                path.display()
+            );
+        }
+    }
+
+    /// Items that claim the same packages share one registration per
+    /// directory, and each keeps its own patterns.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_overlapping_watch_updates_share_directories_and_keep_attribution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        for rel in [
+            "shared/src",
+            "shared/node_modules/dep",
+            "api/src",
+            "web/src",
+        ] {
+            std::fs::create_dir_all(root.join(rel)).unwrap();
+        }
+
+        let mut manager = test_manager(
+            HashMap::new(),
+            std::sync::Arc::new(signal::RecordingDispatch::default()),
+        )
+        .await;
+        let mut warnings = Vec::new();
+        manager.overrides =
+            build_watch_ignore_overrides(&root, &["**/node_modules/**".to_string()], &mut warnings);
+
+        let updates = [
+            ("api", WatchItemKind::Service, vec!["shared/**", "api/**"]),
+            ("web", WatchItemKind::Service, vec!["shared/**", "web/**"]),
+            (
+                "web__graph",
+                WatchItemKind::BuildGraph,
+                vec!["shared/BUILD", "shared/BUILD.bazel", "web/BUILD"],
+            ),
+        ];
+        for (name, kind, patterns) in &updates {
+            let (applied_tx, applied_rx) = oneshot::channel();
+            manager.apply_watch_update(WatchUpdate {
+                name: (*name).to_string(),
+                kind: *kind,
+                patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+                ignore_patterns: vec![],
+                base_dir: root.clone(),
+                applied_tx: Some(applied_tx),
+            });
+            applied_rx.await.unwrap();
+        }
+
+        let mut got: Vec<&PathBuf> = manager.registered_dirs.keys().collect();
+        got.sort();
+        let expected: Vec<PathBuf> = ["api", "api/src", "shared", "shared/src", "web", "web/src"]
+            .iter()
+            .map(|rel| root.join(rel))
+            .collect();
+        assert_eq!(got, expected.iter().collect::<Vec<_>>());
+        assert!(
+            manager
+                .registered_dirs
+                .values()
+                .all(|mode| *mode == RecursiveMode::NonRecursive)
+        );
+
+        for (name, _, patterns) in &updates {
+            let item = manager.items.get(*name).unwrap();
+            let got: Vec<&str> = item.patterns.iter().map(Pattern::as_str).collect();
+            let expected: Vec<String> = patterns
+                .iter()
+                .map(|p| root.join(p).to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(got, expected, "item {name}");
         }
     }
 

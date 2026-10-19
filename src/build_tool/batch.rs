@@ -248,27 +248,38 @@ fn watch_resolution_items(items: &[BatchBuildItem]) -> Vec<&BatchBuildItem> {
         .collect()
 }
 
-pub(crate) async fn send_watch_update(
+/// Queue a watch update without waiting for the watch manager to apply it.
+///
+/// Registration walks every directory the patterns name, so a caller pushing
+/// one update per item would serialise on it if each send waited. Callers
+/// collect the returned receivers and pass them to
+/// [`wait_watch_updates_applied`] at the point that actually needs the
+/// watches in place. `None` if the watch manager has gone away.
+pub(crate) fn send_watch_update(
     tx: &mpsc::UnboundedSender<crate::watch::WatchUpdate>,
     name: String,
     kind: crate::watch::WatchItemKind,
     patterns: Vec<String>,
     ignore_patterns: Vec<String>,
     base_dir: PathBuf,
-) {
+) -> Option<oneshot::Receiver<()>> {
     let (applied_tx, applied_rx) = oneshot::channel();
-    if tx
-        .send(crate::watch::WatchUpdate {
-            name,
-            kind,
-            patterns,
-            ignore_patterns,
-            base_dir,
-            applied_tx: Some(applied_tx),
-        })
-        .is_ok()
-    {
-        let _ = applied_rx.await;
+    tx.send(crate::watch::WatchUpdate {
+        name,
+        kind,
+        patterns,
+        ignore_patterns,
+        base_dir,
+        applied_tx: Some(applied_tx),
+    })
+    .ok()?;
+    Some(applied_rx)
+}
+
+/// Wait until the watch manager has applied every queued update.
+pub(crate) async fn wait_watch_updates_applied(pending: Vec<oneshot::Receiver<()>>) {
+    for applied in pending {
+        let _ = applied.await;
     }
 }
 
@@ -359,6 +370,7 @@ pub(crate) async fn run_graph_requery_worker(
     }
 
     let mut delivered = Vec::new();
+    let mut pending_watch_updates = Vec::new();
     for outcome in outcomes.into_iter().flatten() {
         let info = match outcome.result {
             Ok(info) => info,
@@ -386,16 +398,15 @@ pub(crate) async fn run_graph_requery_worker(
                 ProcessKind::Service => crate::watch::WatchItemKind::Service,
                 ProcessKind::Task => crate::watch::WatchItemKind::Task,
             };
-            send_watch_update(
+            pending_watch_updates.extend(send_watch_update(
                 tx,
                 outcome.name.clone(),
                 watch_kind,
                 info.watch_paths,
                 outcome.ignore_patterns,
                 base_dir.clone(),
-            )
-            .await;
-            send_watch_update(
+            ));
+            pending_watch_updates.extend(send_watch_update(
                 tx,
                 format!("{}__graph", outcome.name),
                 crate::watch::WatchItemKind::BuildGraph,
@@ -407,11 +418,12 @@ pub(crate) async fn run_graph_requery_worker(
                     &outcome.global_watch_ignore,
                 ),
                 base_dir.clone(),
-            )
-            .await;
+            ));
         }
         delivered.push((outcome.name, RequeryOutcome::Updated));
     }
+    // `Updated` promises the new patterns are registered.
+    wait_watch_updates_applied(pending_watch_updates).await;
     delivered
 }
 
@@ -421,8 +433,9 @@ pub(crate) async fn run_graph_requery_worker(
 /// inputs and returns one [`PrepareOutcome`] per item.
 ///
 /// Sends [`crate::watch::WatchUpdate`]s directly to the watch manager as they
-/// resolve — before the builds complete, and therefore before any supervisor
-/// waiting on an outcome can spawn.
+/// resolve. The watch manager registers them while the build runs, and the
+/// chain waits for that to finish before the mtime scan — so before any
+/// supervisor waiting on an outcome can spawn.
 pub(crate) async fn run_batch_build_chain(
     items: Vec<BatchBuildItem>,
     base_dir: PathBuf,
@@ -524,6 +537,10 @@ pub(crate) async fn run_batch_build_chain(
     // `WatchedItem` entry keyed by name. Directories in the watcher dedup
     // via `registered_dirs`, so the actual inotify cost is paid once per
     // directory regardless of how many items claim it.
+    //
+    // The build does not wait for registration: it is awaited before step 4
+    // instead. See there for why that leaves no unwatched window.
+    let mut pending_watch_updates = Vec::new();
     for item in &items {
         let info = resolved_info_by_item.get(&item.name);
         let Some(info) = info else {
@@ -537,25 +554,23 @@ pub(crate) async fn run_batch_build_chain(
                 ProcessKind::Service => crate::watch::WatchItemKind::Service,
                 ProcessKind::Task => crate::watch::WatchItemKind::Task,
             };
-            send_watch_update(
+            pending_watch_updates.extend(send_watch_update(
                 tx,
                 item.name.clone(),
                 watch_kind,
                 info.watch_paths.clone(),
                 item.ignore.clone(),
                 base_dir.clone(),
-            )
-            .await;
+            ));
             if !info.graph_definition_globs.is_empty() {
-                send_watch_update(
+                pending_watch_updates.extend(send_watch_update(
                     tx,
                     format!("{}__graph", item.name),
                     crate::watch::WatchItemKind::BuildGraph,
                     info.graph_definition_globs.clone(),
                     global_watch_ignore.clone(),
                     base_dir.clone(),
-                )
-                .await;
+                ));
             }
         }
     }
@@ -743,6 +758,12 @@ pub(crate) async fn run_batch_build_chain(
         }
     }
 
+    // The scan below covers edits since `scan_since`; the watcher covers
+    // edits after its registration. Registration must finish before the
+    // scan starts, or an edit landing between the two would be seen by
+    // neither.
+    wait_watch_updates_applied(pending_watch_updates).await;
+
     // Step 4: decide each item, newest-mtime scan included. Every requested
     // name gets exactly one outcome — a supervisor is waiting on it and
     // silence would leave it parked forever.
@@ -920,6 +941,56 @@ mod tests {
         let rel = "bazel-out/k8-fastbuild/bin/x";
         let resolved = resolve_bazel_binary_abs_path(&working_dir, rel);
         assert_eq!(resolved, working_dir.join(rel));
+    }
+
+    /// Sending never waits on the watch manager. Only the explicit wait does,
+    /// and it resolves once every update is applied, or the manager is gone.
+    #[tokio::test]
+    async fn watch_updates_queue_without_waiting_and_are_awaited_together() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending: Vec<oneshot::Receiver<()>> = ["api", "api__graph", "web"]
+            .into_iter()
+            .filter_map(|name| {
+                send_watch_update(
+                    &tx,
+                    name.to_string(),
+                    crate::watch::WatchItemKind::Service,
+                    vec![],
+                    vec![],
+                    PathBuf::from("."),
+                )
+            })
+            .collect();
+        assert_eq!(pending.len(), 3);
+
+        let wait = tokio::spawn(wait_watch_updates_applied(pending));
+        let mut applied = Vec::new();
+        for _ in 0..2 {
+            let update = rx.recv().await.unwrap();
+            applied.push(update.name);
+            update.applied_tx.unwrap().send(()).unwrap();
+        }
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "waited before every update applied");
+        // The manager going away mid-batch must not leave the wait parked.
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied, ["api", "api__graph"]);
+
+        assert!(
+            send_watch_update(
+                &tx,
+                "late".to_string(),
+                crate::watch::WatchItemKind::Service,
+                vec![],
+                vec![],
+                PathBuf::from("."),
+            )
+            .is_none()
+        );
     }
 
     fn bazel_item(name: &str, watch_enabled: bool) -> BatchBuildItem {
